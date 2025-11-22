@@ -6,7 +6,7 @@ Given an input image, this script:
   1. Runs YOLO (COCO-pretrained) to detect objects.
   2. Filters detections for 'person' and 'bicycle'.
   3. Forms person–bicycle pairs based on IoU overlap.
-  4. Creates union bounding boxes and crops them from the image.
+  4. Creates *expanded* union bounding boxes and crops them from the image.
   5. Optionally writes the crops to an output directory.
 
 These crops can then be passed to a CLIP-based classifier to decide
@@ -29,6 +29,10 @@ from config import (
     PAIR_IOU_THRESHOLD,
     DEVICE,
 )
+
+# === Crop expansion hyperparameters ===
+CROP_SCALE = 1.8   # how much to expand the union box (1.5–2.0 is a good range)
+CROP_MIN_SIZE = 128  # minimum width/height of crop in pixels
 
 
 @dataclass
@@ -132,6 +136,45 @@ class YoloPersonBicycleCropper:
         y2 = int(min(img_h - 1, max(boxA[3], boxB[3])))
         return x1, y1, x2, y2
 
+    @staticmethod
+    def _expand_box(
+        box: Tuple[int, int, int, int],
+        img_w: int,
+        img_h: int,
+        scale: float = CROP_SCALE,
+        min_size: int = CROP_MIN_SIZE,
+    ) -> Tuple[int, int, int, int]:
+        """
+        Expand a box around its center by a given scale factor and enforce a minimum size.
+        Clips the result to image boundaries.
+
+        Args:
+            box: (x1, y1, x2, y2)
+            img_w, img_h: image dimensions
+            scale: multiplicative expansion factor for width/height
+            min_size: minimum width/height in pixels after expansion
+
+        Returns:
+            Expanded box (x1, y1, x2, y2) as ints.
+        """
+        x1, y1, x2, y2 = box
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+
+        # Expand
+        w_exp = max(w * scale, min_size)
+        h_exp = max(h * scale, min_size)
+
+        cx = x1 + w / 2.0
+        cy = y1 + h / 2.0
+
+        new_x1 = int(max(0, cx - w_exp / 2.0))
+        new_y1 = int(max(0, cy - h_exp / 2.0))
+        new_x2 = int(min(img_w, cx + w_exp / 2.0))
+        new_y2 = int(min(img_h, cy + h_exp / 2.0))
+
+        return new_x1, new_y1, new_x2, new_y2
+
     def run_detection(self, image_path: str) -> List[Detection]:
         """
         Run YOLO on an image and return filtered detections for person and bicycle.
@@ -210,7 +253,7 @@ class YoloPersonBicycleCropper:
         Full pipeline for one image:
           - Run YOLO
           - Build person+bicycle pairs
-          - Generate crops for each pair (optionally save to disk)
+          - Generate *expanded* crops for each pair (optionally save to disk)
 
         Args:
             image_path: Path to input image.
@@ -230,12 +273,28 @@ class YoloPersonBicycleCropper:
             os.makedirs(output_dir, exist_ok=True)
 
         for idx, pair in enumerate(pairs):
-            x1, y1, x2, y2 = pair.union_box
-            crop_img = img.crop((x1, y1, x2, y2))
+            # Start from the tight union box...
+            ux1, uy1, ux2, uy2 = pair.union_box
+            # ...then expand it for more context and minimum size
+            ex1, ey1, ex2, ey2 = self._expand_box(
+                (ux1, uy1, ux2, uy2),
+                img_w=img_w,
+                img_h=img_h,
+            )
+
+            # Safety check: skip degenerate boxes
+            if ex2 <= ex1 or ey2 <= ey1:
+                print(f"[WARN] Skipping degenerate expanded box for pair {idx} in {image_path}")
+                continue
+
+            crop_img = img.crop((ex1, ey1, ex2, ey2))
 
             if output_dir:
                 base_name = os.path.splitext(os.path.basename(image_path))[0]
-                fname = f"{prefix}_{base_name}_pair{idx}_p{pair.person.conf:.2f}_b{pair.bicycle.conf:.2f}.jpg"
+                fname = (
+                    f"{prefix}_{base_name}_pair{idx}_"
+                    f"p{pair.person.conf:.2f}_b{pair.bicycle.conf:.2f}.jpg"
+                )
                 out_path = os.path.join(output_dir, fname)
                 crop_img.save(out_path)
                 pair.crop_path = out_path
@@ -316,6 +375,7 @@ def main() -> None:
     print(f"Detected person+bicycle pairs (IoU≥{args.pair_iou}): {total_pairs}")
     print(f"Crops saved in: {args.output_dir}")
     print("================================")
+
 
 if __name__ == "__main__":
     main()
