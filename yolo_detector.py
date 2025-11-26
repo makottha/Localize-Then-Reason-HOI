@@ -1,7 +1,9 @@
-# yolo_detector.py
-
+# yolo_pairs.py
+import os
+from dataclasses import dataclass
 from typing import List, Tuple
 
+import numpy as np
 from PIL import Image
 from ultralytics import YOLO
 
@@ -11,22 +13,31 @@ from config import (
     YOLO_IOU_THRESHOLD,
     PAIR_IOU_THRESHOLD,
     DEVICE,
-    CROP_SCALE,
-    CROP_MIN_SIZE,
 )
-from detection_types import (
-    Detection,
-    PersonBicyclePair,
-    compute_iou,
-    union_box,
-    expand_box,
-)
+
+CROP_SCALE = 1.8       # same as before
+CROP_MIN_SIZE = 128    # same as before
+
+
+@dataclass
+class Detection:
+    cls_id: int
+    cls_name: str
+    conf: float
+    box_xyxy: Tuple[float, float, float, float]
+
+
+@dataclass
+class PersonBicyclePair:
+    person: Detection
+    bicycle: Detection
+    union_box: Tuple[int, int, int, int]
 
 
 class YoloPersonBicycleDetector:
     """
-    Runs YOLO on an image, finds person+bicycle pairs, and
-    (optionally) prepares expanded union boxes.
+    Core YOLO wrapper to detect person+bicycle and build pairs.
+    Can work on image paths OR raw frames.
     """
 
     def __init__(
@@ -45,12 +56,10 @@ class YoloPersonBicycleDetector:
         print(f"[INFO] Loading YOLO model from '{model_path}' on device: {self.device}")
         self.model = YOLO(model_path)
 
-        # Resolve class IDs for person and bicycle from model names
         self.names = self.model.model.names if hasattr(self.model, "model") else self.model.names
         self.person_id = self._get_class_id("person")
         self.bicycle_id = self._get_class_id("bicycle")
-
-        print(f"[INFO] Detected class IDs: person={self.person_id}, bicycle={self.bicycle_id}")
+        print(f"[INFO] YOLO classes: person={self.person_id}, bicycle={self.bicycle_id}")
 
     def _get_class_id(self, class_name: str) -> int:
         if isinstance(self.names, dict):
@@ -63,22 +72,87 @@ class YoloPersonBicycleDetector:
                     return idx
         raise ValueError(f"Class '{class_name}' not found in YOLO model names.")
 
-    def run_detection(self, image_path: str) -> List[Detection]:
-        """
-        Run YOLO on an image and return filtered detections for person and bicycle.
-        """
-        results = self.model(
-            image_path,
-            conf=self.conf_thres,
-            iou=self.iou_thres,
-            verbose=False,
-        )
-        r = results[0]
+    @staticmethod
+    def _compute_iou(
+        boxA: Tuple[float, float, float, float],
+        boxB: Tuple[float, float, float, float],
+    ) -> float:
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[2], boxB[2])
+        yB = min(boxA[3], boxB[3])
 
+        interW = max(0.0, xB - xA)
+        interH = max(0.0, yB - yA)
+        interArea = interW * interH
+        if interArea <= 0:
+            return 0.0
+
+        boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+        boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+        return float(interArea / max(boxAArea + boxBArea - interArea, 1e-6))
+
+    @staticmethod
+    def _union_box(
+        boxA: Tuple[float, float, float, float],
+        boxB: Tuple[float, float, float, float],
+        img_w: int,
+        img_h: int,
+    ) -> Tuple[int, int, int, int]:
+        x1 = int(max(0, min(boxA[0], boxB[0])))
+        y1 = int(max(0, min(boxA[1], boxB[1])))
+        x2 = int(min(img_w - 1, max(boxA[2], boxB[2])))
+        y2 = int(min(img_h - 1, max(boxA[3], boxB[3])))
+        return x1, y1, x2, y2
+
+    @staticmethod
+    def _expand_box(
+        box: Tuple[int, int, int, int],
+        img_w: int,
+        img_h: int,
+        scale: float = CROP_SCALE,
+        min_size: int = CROP_MIN_SIZE,
+    ) -> Tuple[int, int, int, int]:
+        x1, y1, x2, y2 = box
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+
+        w_exp = max(w * scale, min_size)
+        h_exp = max(h * scale, min_size)
+
+        cx = x1 + w / 2.0
+        cy = y1 + h / 2.0
+
+        new_x1 = int(max(0, cx - w_exp / 2.0))
+        new_y1 = int(max(0, cy - h_exp / 2.0))
+        new_x2 = int(min(img_w, cx + w_exp / 2.0))
+        new_y2 = int(min(img_h, cy + h_exp / 2.0))
+
+        return new_x1, new_y1, new_x2, new_y2
+
+    # ---------- detection on image path (for generate_crops) ----------
+
+    def _run_yolo_on_image_path(self, image_path: str) -> List[Detection]:
+        results = self.model(image_path, conf=self.conf_thres, iou=self.iou_thres, verbose=False)
+        r = results[0]
         boxes = r.boxes
         if boxes is None or len(boxes) == 0:
             return []
 
+        return self._filter_person_bicycle(boxes)
+
+    # ---------- detection on frame (for video) ----------
+
+    def _run_yolo_on_frame(self, frame_bgr: np.ndarray) -> List[Detection]:
+        results = self.model(frame_bgr, conf=self.conf_thres, iou=self.iou_thres, verbose=False)
+        r = results[0]
+        boxes = r.boxes
+        if boxes is None or len(boxes) == 0:
+            return []
+
+        return self._filter_person_bicycle(boxes)
+
+    def _filter_person_bicycle(self, boxes) -> List[Detection]:
         cls_ids = boxes.cls.cpu().numpy()
         confs = boxes.conf.cpu().numpy()
         xyxy = boxes.xyxy.cpu().numpy()
@@ -103,55 +177,45 @@ class YoloPersonBicycleDetector:
             )
         return detections
 
-    def build_pairs(
-        self,
-        detections: List[Detection],
-        img_size: Tuple[int, int],
-    ) -> List[PersonBicyclePair]:
-        """
-        Given detections, build person–bicycle pairs with IoU > threshold.
-        """
-        img_w, img_h = img_size
-        persons = [d for d in detections if d.cls_id == self.person_id]
-        bicycles = [d for d in detections if d.cls_id == self.bicycle_id]
+    # ---------- public helpers ----------
 
-        pairs: List[PersonBicyclePair] = []
-        for p in persons:
-            for b in bicycles:
-                iou = compute_iou(p.box_xyxy, b.box_xyxy)
-                if iou >= self.pair_iou_thres:
-                    ubox = union_box(p.box_xyxy, b.box_xyxy, img_w, img_h)
-                    pairs.append(PersonBicyclePair(person=p, bicycle=b, union_box=ubox))
-        return pairs
-
-    def generate_expanded_crops(
+    def detect_pairs_in_image(
         self,
         image_path: str,
-    ) -> Tuple[Image.Image, List[Tuple[PersonBicyclePair, Tuple[int, int, int, int]]]]:
-        """
-        Utility used by both crop scripts and video annotator.
-
-        Returns:
-            original PIL image,
-            list of (pair, expanded_box) where expanded_box=(x1,y1,x2,y2)
-        """
+    ) -> Tuple[List[Tuple[PersonBicyclePair, Tuple[int, int, int, int]]], Tuple[int, int]]:
         img = Image.open(image_path).convert("RGB")
         img_w, img_h = img.size
 
-        detections = self.run_detection(image_path)
-        pairs = self.build_pairs(detections, (img_w, img_h))
+        detections = self._run_yolo_on_image_path(image_path)
+        return self._build_pairs(detections, img_w, img_h), (img_w, img_h)
 
-        expanded = []
-        for pair in pairs:
-            ex1, ey1, ex2, ey2 = expand_box(
-                pair.union_box,
-                img_w=img_w,
-                img_h=img_h,
-                scale=CROP_SCALE,
-                min_size=CROP_MIN_SIZE,
-            )
-            if ex2 <= ex1 or ey2 <= ey1:
-                continue
-            expanded.append((pair, (ex1, ey1, ex2, ey2)))
+    def detect_pairs_in_frame(
+        self,
+        frame_bgr: np.ndarray,
+    ) -> List[Tuple[PersonBicyclePair, Tuple[int, int, int, int]]]:
+        h, w = frame_bgr.shape[:2]
+        detections = self._run_yolo_on_frame(frame_bgr)
+        return self._build_pairs(detections, w, h)
 
-        return img, expanded
+    def _build_pairs(
+        self,
+        detections: List[Detection],
+        img_w: int,
+        img_h: int,
+    ) -> List[Tuple[PersonBicyclePair, Tuple[int, int, int, int]]]:
+        persons = [d for d in detections if d.cls_id == self.person_id]
+        bicycles = [d for d in detections if d.cls_id == self.bicycle_id]
+
+        pairs_with_boxes: List[Tuple[PersonBicyclePair, Tuple[int, int, int, int]]] = []
+
+        for p in persons:
+            for b in bicycles:
+                iou = self._compute_iou(p.box_xyxy, b.box_xyxy)
+                if iou >= self.pair_iou_thres:
+                    union = self._union_box(p.box_xyxy, b.box_xyxy, img_w, img_h)
+                    expanded = self._expand_box(union, img_w, img_h)
+                    pairs_with_boxes.append(
+                        (PersonBicyclePair(person=p, bicycle=b, union_box=union), expanded)
+                    )
+
+        return pairs_with_boxes
